@@ -17,26 +17,34 @@ from airflow.exceptions import AirflowException
 from custom_functions.FindLogErrors import FindLogErrors
 
 # Variables
-NAMENODE = Variable.get("NAMENODE_HOST")
-API_USER = Variable.get("CDP_USER")
-API_PASSWORD = Variable.get("CDP_PASSWORD")
-CLUSTER_NAME = Variable.get("CLUSTER_NAME")
-bucket_path = Variable.get("BUCKET_INTERMEDIARY")
+NAMENODE = Variable.get("NAMENODE_HOST", "default_namenode_host")
+CLUSTER_NAME = Variable.get("CLUSTER_NAME", "default_cluster_name")
+API_CREDENTIALS = Variable.get("API_CREDENTIALS", "default_api_credentials")
+bucket_path = Variable.get("BUCKET_INTERMEDIARY", "default_bucket_path")
 project_path = f"gs://{bucket_path}/repo_name"
 
-# Email setup for error notifications
+API_TIMEOUT = (10, 30)  # Timeout in seconds for API requests
+
+# Initial validation of required variables
+if not NAMENODE or not CLUSTER_NAME or not API_CREDENTIALS:
+    raise AirflowException("Missing required configurations.")
+
+# Email configuration for error notification
 error_email = FindLogErrors(
-    email="fakemail@mail.com",
-    id_user="user_id",
-    user_name="username",
+    email="default@company.com",
+    id_user="123456789",
+    user_name="Default User",
     urgency=0,
-    tags=[5],
-    bitbucket_repo="https://bitbucket.org/organisation/repo_name/",
-    sla="2 hours",
+    tags=[0],
+    responsible_team="Default Team",
+    bitbucket_repository="https://bitbucket.org/default_repo",
+    support_period="09:00 - 18:00",
+    sla="2 Hours",
     emails_to_send=[
-        "fakemail@mail.com",
+        "email1@company.com",
+        "email2@company.com",
     ],
-    email_copia="fakemail@mail.com",
+    cc_email="default@company.com",
 )
 
 # Default DAG arguments
@@ -49,42 +57,54 @@ default_args = {
     "on_failure_callback": error_email.buildEmail,
 }
 
-# Function to check the current hour and decide the next task
+# Function to check the current hour
 def check_hour():
     current_time = datetime.now()
-    return "upscale_cluster.upscale_nodes" if current_time.hour >= 10 else "downscale_success"
+    if current_time.hour >= 10:
+        logging.info("Current hour >= 10h. Scaling up.")
+        return "upscale_cluster.upscale_nodes"
+    else:
+        logging.info("Current hour < 10h. Redirecting to downscale_success.")
+        return "downscale_success"
 
-# Function to fetch the last execution date of the "nivel_risco" DAG
-def get_execution_date_dag_name(**kwargs):
-    dag_id = "dag_name"
+# Function to get the last execution of the "dag id" DAG
+def get_execution_date_dag_id(**kwargs):
+    dag_id = "dag_id_name"
     try:
         with create_session() as session:
-            dag_a_last_run = (
+            dag_last_run = (
                 session.query(DagRun)
                 .filter(DagRun.dag_id == dag_id)
                 .filter(DagRun.state == "success")
                 .order_by(DagRun.execution_date.desc())
                 .first()
             )
-            
-            if dag_a_last_run:
-                execution_date = dag_a_last_run.execution_date
-                logging.info(f"Last execution date of DAG '{dag_id}': {execution_date}")
+            if dag_last_run:
+                execution_date = dag_last_run.execution_date
+                logging.info(f"[Task {kwargs['task_id']}] Last execution of DAG '{dag_id}': {execution_date}")
                 return execution_date
-            return logging.error(f"Error fetching the last execution date for DAG '{dag_id}': {e}")
-    except requests.RequestException as e:
-        raise AirflowException(f"Error fetching the last execution date for DAG '{dag_id}': {e}")
+            logging.warning(f"[Task {kwargs['task_id']}] No successful execution found for DAG '{dag_id}'.")
+            return None
+    except Exception as e:
+        raise AirflowException(f"Error fetching last execution of DAG '{dag_id}': {e}")
 
-# Function to retrieve HDFS block metrics
+# Function to fetch HDFS block metrics
 def get_hdfs_blocks():
     url = os.path.join(NAMENODE, "cdp-proxy-api/cm-api/v51/timeseries")
     query = f"select under_replicated_blocks_across_hdfss WHERE clusterName = '{CLUSTER_NAME}'"
     current_time = int(time.time() * 1000)
     start_time = current_time - 3600000
-    params = {"query": query, "startTime": str(start_time), "endTime": str(current_time)}
-
+    params = {
+        "query": query,
+        "startTime": str(start_time),
+        "endTime": str(current_time),
+    }
+    headers = {
+        "Authorization": API_CREDENTIALS,
+        "Content-Type": "application/json",
+    }
     try:
-        response = requests.get(url, params=params, auth=(API_USER, API_PASSWORD), timeout=(5, 15))
+        response = requests.get(url, params=params, headers=headers, timeout=API_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         items = data.get("items", [])
@@ -93,20 +113,27 @@ def get_hdfs_blocks():
             last_value = data_points[-1].get("value", 0) if data_points else 0
             logging.info(f"Under-replicated HDFS blocks: {last_value}")
             return last_value
-        return None
+        return 0
     except requests.RequestException as e:
         raise AirflowException(f"API connection error: {e}")
 
-# Function to perform health check
+# Function to perform health checks
 def get_health_check():
     url = os.path.join(NAMENODE, "cdp-proxy-api/cm-api/v51/timeseries")
     query = f"select health_bad_rate WHERE clusterName = '{CLUSTER_NAME}'"
     current_time = int(time.time() * 1000)
     start_time = current_time - 3600000
-    params = {"query": query, "startTime": str(start_time), "endTime": str(current_time)}
-
+    params = {
+        "query": query,
+        "startTime": str(start_time),
+        "endTime": str(current_time),
+    }
+    headers = {
+        "Authorization": API_CREDENTIALS,
+        "Content-Type": "application/json",
+    }
     try:
-        response = requests.get(url, params=params, auth=(API_USER, API_PASSWORD), timeout=(5, 15))
+        response = requests.get(url, params=params, headers=headers, timeout=API_TIMEOUT)
         response.raise_for_status()
         data = response.json()
         items = data.get("items", [])
@@ -115,21 +142,31 @@ def get_health_check():
             last_value = data_points[-1].get("value", 0) if data_points else 0
             logging.info(f"Health check metric: {last_value}")
             return last_value
-        return None
+        return 0
     except requests.RequestException as e:
         raise AirflowException(f"API connection error: {e}")
+
+# Function to verify cluster state before scaling down nodes
+def verify_cluster_state(nodes, **kwargs):
+    blocks = get_hdfs_blocks()
+    health = get_health_check()
+    if blocks > 100 or health > 0.05:
+        raise AirflowException(
+            f"Unsafe conditions for downscale: blocks={blocks}, health={health}"
+        )
+    logging.info(f"Conditions verified for downscale to {nodes} nodes.")
+    return "downscale_success"
 
 # Define the DAG
 with DAG(
     "dag_name",
-    start_date=datetime(1900, 1, 1),
+    start_date=datetime(2024, 9, 16),
     default_args=default_args,
     schedule_interval=None,
     catchup=False,
     max_active_runs=1,
-    tags=["TAG"],
+    tags=["PRODUCTION", "MONTHLY"],
 ) as dag:
-
     t_check_hour = BranchPythonOperator(
         task_id="check_hour",
         python_callable=check_hour,
@@ -138,33 +175,35 @@ with DAG(
     with TaskGroup("upscale_cluster") as upscale_group:
         upscale_nodes = SSHOperator(
             task_id="upscale_nodes",
-            ssh_conn_id="test-ssh",
-            command=f"cdp datahub scale-cluster --cluster-name {CLUSTER_NAME} --instance-group-name worker --instance-group-desired-count 30"
+            ssh_conn_id="default_ssh_conn_id",
+            command=f"cdp datahub scale-cluster --cluster-name {CLUSTER_NAME} --instance-group-name worker --instance-group-desired-count 30",
         )
 
-    t_dag__sensor = ExternalTaskSensor(
-        task_id="dag_id",
-        external_dag_id="dag_name",
-        external_task_id="task_name",
+    t_task_sensor = ExternalTaskSensor(
+        task_id="task_sensor",
+        external_dag_id="DEFAULT_EXTERNAL_DAG_ID",
+        external_task_id="DEFAULT_EXTERNAL_TASK_ID",
         allowed_states=["success"],
         mode="poke",
         timeout=1800,
     )
 
-    t_get_execution_date_dag_name = PythonOperator(
-        task_id="get_execution_date_dag_name",
-        python_callable=get_execution_date_dag_name,
+    t_get_execution_dag_id_level = PythonOperator(
+        task_id="get_execution_dag_id_level",
+        python_callable=get_execution_dag_id_level,
         provide_context=True,
     )
 
     t_hdfs_data = PythonOperator(
         task_id="get_hdfs_blocks",
         python_callable=get_hdfs_blocks,
+        provide_context=True,
     )
 
     t_health_check = PythonOperator(
         task_id="get_health_check",
         python_callable=get_health_check,
+        provide_context=True,
     )
 
     with TaskGroup("downscale_cluster") as downscale_group:
@@ -172,18 +211,26 @@ with DAG(
         for nodes in [14, 8, 5, 3]:
             downscale = SSHOperator(
                 task_id=f"downscale_{nodes}_nodes",
-                ssh_conn_id="conn_id",
-                command=f"cdp datahub scale-cluster --cluster-name {CLUSTER_NAME} --instance-group-name worker --instance-group-desired-count {nodes}"
+                ssh_conn_id="default_ssh_conn_id",
+                command=f"cdp datahub scale-cluster --cluster-name {CLUSTER_NAME} --instance-group-name worker --instance-group-desired-count {nodes}",
             )
-            check_blocks = PythonOperator(task_id=f"check_blocks_{nodes}", python_callable=get_hdfs_blocks)
-            health_check = PythonOperator(task_id=f"health_check_{nodes}", python_callable=get_health_check)
+            verify_task = PythonOperator(
+                task_id=f"verify_downscale_{nodes}",
+                python_callable=verify_cluster_state,
+                op_args=[nodes],
+                provide_context=True,
+            )
             if previous_task:
                 previous_task >> downscale
-            downscale >> check_blocks >> health_check
-            previous_task = health_check
+            downscale >> verify_task
+            previous_task = verify_task
 
     success = EmptyOperator(task_id="downscale_success")
 
-    t_check_hour >> upscale_group >> t_dag__sensor
-    t_dag__sensor >> t_get_execution_date_dag_name >> t_hdfs_data
-    t_hdfs_data >> downscale_group >> success
+    t_check_hour >> [upscale_group, success]
+    upscale_group >> t_task_sensor
+    t_task_sensor >> t_get_execution_date_dag_id
+    t_get_execution_date_dag_id >> [t_hdfs_data, t_health_check]
+    t_hdfs_data >> downscale_group
+    t_health_check >> downscale_group
+    downscale_group >> success
