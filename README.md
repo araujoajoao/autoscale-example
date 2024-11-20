@@ -92,7 +92,5 @@ Scaling Commands: CDP scaling operations are executed via SSH using commands lik
 ```python
 cdp datahub scale-cluster --cluster-name CLUSTER_NAME --instance-group-name worker --instance-group-desired-count X
 ```
-
-
-### **Replace CLUSTER_NAME and X with appropriate values.**
+Replace CLUSTER_NAME and X with appropriate values.
 Logging and Debugging: The DAG includes detailed logging to facilitate debugging and audit trails.
