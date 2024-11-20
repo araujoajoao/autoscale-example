@@ -71,17 +71,17 @@ error_email = FindLogErrors(
     cc_email="operations@company.com",
 )
 ```
-### **Workflow Overview**
+## Workflow Overview
 
-# Check Current Time
+### **Check Current Time**
 The DAG determines whether to initiate upscaling or proceed to downscaling based on the current time.
-# Upscaling Process
+### Upscaling Process**
 A predefined number of worker nodes (e.g., 30) are added to the cluster using SSH commands.
-# Inter-DAG Dependencies
+### Inter-DAG Dependencies**
 The DAG uses an external task sensor to wait for successful completion of another DAG (IFRS9_90_DAYS) before proceeding with operations.
-# Downscaling Process
+##3 Downscaling Process**
 Nodes are reduced sequentially in steps (e.g., 14 → 8 → 5 → 3), ensuring that conditions for safe downscaling are met.
-# Success Completion
+### Success Completion**
 On successful execution, the DAG completes with a downscale_success marker.
 
 ### **Additional Notes**
