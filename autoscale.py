@@ -14,7 +14,9 @@ from airflow.models.dag import DagRun
 from airflow.utils.task_group import TaskGroup
 from airflow.exceptions import AirflowException
 from custom_functions.FindLogErrors import FindLogErrors
-from typing import Optional, List, Dict, Any
+from custom_functions.slack_notification import send_slack_notification
+from custom_functions.cluster_metrics import ClusterMetrics
+
 
 # Notificação para sucesso no Slack
 def send_slack_notification(**kwargs):
@@ -70,7 +72,7 @@ def check_hour(**context) -> str:
         str: Nome do branch a ser executado
     """
     current_hour = datetime.now().hour
-    if 8 <= current_hour <= 18:  # horário comercial
+    if 8 <= current_hour <= 18:  # horario comercial
         return "upscale_cluster"
     return "downscale_success"
 
@@ -182,7 +184,7 @@ with DAG(
     doc_md="""
     # Cluster Autoscaling DAG
     
-    Gerencia o escalonamento automático de clusters com base no horário e m��tricas de saúde.
+    Gerencia o escalonamento automático de clusters com base no horário e métricas de saúde.
     """,
 ) as dag:
     t_check_hour = BranchPythonOperator(
