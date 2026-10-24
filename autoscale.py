@@ -1,37 +1,215 @@
 # -*- coding: utf-8 -*-
-import os
-import time
-from datetime import datetime, timedelta
+"""
+DAG de Autoescalonamento de Cluster Cloudera (CDP).
+
+Gerencia o escalonamento automático (upscale e downscale gradual) de nós worker
+com base no horário de execução, conclusão de DAGs externas e métricas de saúde do HDFS.
+"""
+
+from __future__ import annotations
+
 import logging
+import time
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import Any
+from urllib.parse import urljoin
+
+import pendulum
 import requests
 from airflow import DAG
-from airflow.models import Variable
-from airflow.operators.python import PythonOperator, BranchPythonOperator
-from airflow.operators.empty import EmptyOperator
-from airflow.providers.ssh.operators.ssh import SSHOperator
-from airflow.sensors.external_task_sensor import ExternalTaskSensor
-from airflow.models.dag import DagRun
-from airflow.utils.task_group import TaskGroup
 from airflow.exceptions import AirflowException
+from airflow.models import Variable
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import BranchPythonOperator, PythonOperator
+from airflow.providers.ssh.operators.ssh import SSHOperator
+from airflow.sensors.external_task import ExternalTaskSensor
+from airflow.utils.task_group import TaskGroup
+from airflow.utils.trigger_rule import TriggerRule
+
 from custom_functions.FindLogErrors import FindLogErrors
-from custom_functions.slack_notification import send_slack_notification
-from custom_functions.cluster_metrics import ClusterMetrics
+
+logger = logging.getLogger(__name__)
 
 
-# Notificação para sucesso no Slack
-def send_slack_notification(**kwargs):
-    """Envia uma notificação para Slack no caso de sucesso."""
-    slack_webhook_url = Variable.get("SLACK_WEBHOOK_URL", "")
-    if slack_webhook_url:
-        message = "DAG finalizado com sucesso: `{}`".format(kwargs['dag'].dag_id)
+@dataclass(frozen=True)
+class ClusterConfig:
+    """Parâmetros e limites operacionais para escalonamento seguro do cluster."""
+
+    MAX_BLOCKS: int = 100
+    MAX_HEALTH_RATE: float = 0.05
+    MIN_NODES: int = 3
+    MAX_NODES: int = 30
+    SCALE_DOWN_STEPS: tuple[int, ...] = (14, 8, 5, 3)
+    BUSINESS_HOUR_START: int = 8
+    BUSINESS_HOUR_END: int = 18
+    SSH_CONN_ID: str = "default_ssh_conn_id"
+    INSTANCE_GROUP: str = "worker"
+    TIMEZONE: str = "America/Sao_Paulo"
+
+
+def send_slack_notification(context: dict[str, Any]) -> None:
+    """Envia uma notificação ao Slack quando o DAG finaliza com sucesso."""
+    slack_webhook_url = Variable.get("SLACK_WEBHOOK_URL", default_var="")
+    if not slack_webhook_url:
+        logger.info("SLACK_WEBHOOK_URL não configurada; notificação ignorada.")
+        return
+
+    dag_id = context["dag"].dag_id
+    logical_date = context.get("logical_date") or context.get("execution_date")
+    message = f":white_check_mark: DAG finalizado com sucesso: `{dag_id}` (Execução: `{logical_date}`)"
+
+    try:
+        response = requests.post(
+            slack_webhook_url,
+            json={"text": message},
+            timeout=(5, 15),
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("Falha ao enviar notificação para o Slack: %s", exc)
+
+
+class ClusterMetrics:
+    """Cliente para consulta de séries temporais na API do Cloudera Manager."""
+
+    API_TIMEOUT: tuple[int, int] = (10, 30)
+    TIMESERIES_ENDPOINT: str = "cdp-proxy-api/cm-api/v51/timeseries"
+
+    @classmethod
+    def fetch_metric(
+        cls,
+        namenode_url: str,
+        api_credentials: str,
+        query: str,
+        start_time_ms: int,
+        end_time_ms: int,
+    ) -> float:
+        """
+        Consulta o último valor de uma métrica no Cloudera Manager.
+
+        Raises:
+            AirflowException: Em caso de erro HTTP ou falha de conectividade.
+        """
+        base_url = namenode_url.rstrip("/") + "/"
+        url = urljoin(base_url, cls.TIMESERIES_ENDPOINT)
+        headers = {
+            "Authorization": api_credentials,
+            "Content-Type": "application/json",
+        }
+        params = {
+            "query": query,
+            "startTime": str(start_time_ms),
+            "endTime": str(end_time_ms),
+        }
+
         try:
-            response = requests.post(slack_webhook_url, json={"text": message})
-            if response.status_code != 200:
-                logging.warning(f"Falha ao enviar notificação Slack: {response.text}")
-        except Exception as e:
-            logging.error(f"Erro ao enviar notificação Slack: {e}")
+            response = requests.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=cls.API_TIMEOUT,
+            )
+            response.raise_for_status()
+            data = response.json()
 
-# Configuração de email para erros
+            items = data.get("items") or []
+            if not items:
+                return 0.0
+
+            time_series = items[0].get("timeSeries") or []
+            if not time_series:
+                return 0.0
+
+            data_points = time_series[0].get("data") or []
+            if not data_points:
+                return 0.0
+
+            return float(data_points[-1].get("value", 0.0))
+
+        except (requests.RequestException, ValueError) as exc:
+            raise AirflowException(f"Erro ao consultar métrica na API Cloudera: {exc}") from exc
+
+
+def check_hour(**context: Any) -> str:
+    """
+    Avalia o horário atual no fuso configurado e define o fluxo de execução.
+
+    Returns:
+        str: Task ID inicial do grupo de upscale (horário comercial) ou
+             Task ID inicial do grupo de downscale (fora do horário comercial).
+    """
+    tz = pendulum.timezone(ClusterConfig.TIMEZONE)
+    current_hour = pendulum.now(tz).hour
+    logger.info("Hora atual (%s): %02d:00", ClusterConfig.TIMEZONE, current_hour)
+
+    if ClusterConfig.BUSINESS_HOUR_START <= current_hour <= ClusterConfig.BUSINESS_HOUR_END:
+        return "upscale_cluster.upscale_nodes"
+
+    first_step = ClusterConfig.SCALE_DOWN_STEPS[0]
+    return f"downscale_cluster.verify_downscale_{first_step}"
+
+
+def verify_cluster_state(target_nodes: int, **context: Any) -> None:
+    """
+    Valida blocos sub-replicados do HDFS e a taxa de erro de saúde do cluster
+    ANTES de executar cada etapa de redução de nós.
+
+    Args:
+        target_nodes: Número de nós alvo da etapa atual de downscale.
+
+    Raises:
+        AirflowException: Se qualquer métrica ultrapassar os limites de segurança.
+    """
+    namenode = Variable.get("NAMENODE")
+    api_credentials = Variable.get("API_CREDENTIALS")
+    cluster_name = Variable.get("CLUSTER_NAME")
+
+    logger.info("Validando saúde do cluster '%s' antes do downscale para %d nós.", cluster_name, target_nodes)
+
+    current_time_ms = int(time.time() * 1000)
+    one_hour_ago_ms = current_time_ms - 3_600_000
+
+    blocks_query = (
+        f"SELECT under_replicated_blocks_across_hdfss WHERE clusterName = '{cluster_name}'"
+    )
+    health_query = (
+        f"SELECT health_bad_rate WHERE clusterName = '{cluster_name}'"
+    )
+
+    blocks = ClusterMetrics.fetch_metric(
+        namenode_url=namenode,
+        api_credentials=api_credentials,
+        query=blocks_query,
+        start_time_ms=one_hour_ago_ms,
+        end_time_ms=current_time_ms,
+    )
+    logger.info("Blocos sub-replicados no HDFS: %s (Limite: %s)", blocks, ClusterConfig.MAX_BLOCKS)
+
+    health_bad_rate = ClusterMetrics.fetch_metric(
+        namenode_url=namenode,
+        api_credentials=api_credentials,
+        query=health_query,
+        start_time_ms=one_hour_ago_ms,
+        end_time_ms=current_time_ms,
+    )
+    logger.info("Taxa de saúde ruim: %s (Limite: %s)", health_bad_rate, ClusterConfig.MAX_HEALTH_RATE)
+
+    if blocks > ClusterConfig.MAX_BLOCKS:
+        raise AirflowException(
+            f"Downscale abortado para {target_nodes} nós: blocos não replicados ({blocks}) "
+            f"acima do limite ({ClusterConfig.MAX_BLOCKS})."
+        )
+
+    if health_bad_rate > ClusterConfig.MAX_HEALTH_RATE:
+        raise AirflowException(
+            f"Downscale abortado para {target_nodes} nós: taxa de saúde ruim ({health_bad_rate}) "
+            f"acima do limite ({ClusterConfig.MAX_HEALTH_RATE})."
+        )
+
+    logger.info("Cluster saudável. Autorizado o downscale para %d nós.", target_nodes)
+
+
 error_email = FindLogErrors(
     email="default@company.com",
     id_user="123456789",
@@ -49,8 +227,8 @@ error_email = FindLogErrors(
     cc_email="default@company.com",
 )
 
-# Configurações padrão do DAG
 default_args = {
+    "owner": "data-engineering",
     "depends_on_past": False,
     "retries": 3,
     "retry_delay": timedelta(minutes=3),
@@ -59,178 +237,99 @@ default_args = {
     "on_failure_callback": error_email.buildEmail,
 }
 
-# Adicionar as variáveis faltantes
-NAMENODE = Variable.get("NAMENODE")
-API_CREDENTIALS = Variable.get("API_CREDENTIALS")
-CLUSTER_NAME = Variable.get("CLUSTER_NAME")
-
-# Adicionar a função check_hour
-def check_hour(**context) -> str:
-    """
-    Verifica a hora atual e decide o branch apropriado.
-    Returns:
-        str: Nome do branch a ser executado
-    """
-    current_hour = datetime.now().hour
-    if 8 <= current_hour <= 18:  # horario comercial
-        return "upscale_cluster"
-    return "downscale_success"
-
-# Classe para encapsular lógica da API
-class ClusterMetrics:
-    """Classe para encapsular métricas do cluster."""
-    API_TIMEOUT: tuple[int, int] = (10, 30)
-    
-    @staticmethod
-    def fetch_metric(query: str, cluster_name: str, start_time: int, end_time: int) -> float:
-        """Consulta a métrica usando a API."""
-        url = os.path.join(NAMENODE, "cdp-proxy-api/cm-api/v51/timeseries")
-        headers = {
-            "Authorization": API_CREDENTIALS,
-            "Content-Type": "application/json",
-        }
-        params = {
-            "query": query,
-            "startTime": str(start_time),
-            "endTime": str(end_time),
-        }
-        try:
-            response = requests.get(url, params=params, headers=headers, timeout=ClusterMetrics.API_TIMEOUT)
-            response.raise_for_status()
-            data = response.json()
-            items = data.get("items", [])
-            if items:
-                data_points = items[0].get("timeSeries", [])[0].get("data", [])
-                return data_points[-1].get("value", 0) if data_points else 0
-            return 0
-        except requests.RequestException as e:
-            raise AirflowException(f"Erro na conexão com a API: {e}")
-
-# Função para validação antes do escalonamento para baixo
-def verify_cluster_state(nodes: int, **kwargs) -> str:
-    """
-    Verifica o estado do cluster antes do downscale.
-    
-    Args:
-        nodes: Número de nós alvo
-        **kwargs: Argumentos do contexto do Airflow
-        
-    Returns:
-        str: Nome da próxima task
-        
-    Raises:
-        AirflowException: Se as condições não forem seguras para downscale
-    """
-    logging.info(f"Iniciando verificação para downscale para {nodes} nós")
-    
-    current_time = int(time.time() * 1000)
-    start_time = current_time - 3600000  # Última hora
-    
-    try:
-        blocks = ClusterMetrics.fetch_metric(
-            f"select under_replicated_blocks_across_hdfss WHERE clusterName = '{CLUSTER_NAME}'",
-            CLUSTER_NAME,
-            start_time,
-            current_time
-        )
-        logging.info(f"Blocos não replicados: {blocks}")
-        
-        health = ClusterMetrics.fetch_metric(
-            f"select health_bad_rate WHERE clusterName = '{CLUSTER_NAME}'",
-            CLUSTER_NAME,
-            start_time,
-            current_time
-        )
-        logging.info(f"Taxa de saúde ruim: {health}")
-        
-        if blocks > ClusterConfig.MAX_BLOCKS:
-            raise AirflowException(
-                f"Número de blocos não replicados ({blocks}) excede o limite ({ClusterConfig.MAX_BLOCKS})"
-            )
-            
-        if health > ClusterConfig.MAX_HEALTH_RATE:
-            raise AirflowException(
-                f"Taxa de saúde ruim ({health}) excede o limite ({ClusterConfig.MAX_HEALTH_RATE})"
-            )
-            
-        logging.info(f"Verificação concluída com sucesso para {nodes} nós")
-        return "downscale_success"
-        
-    except Exception as e:
-        logging.error(f"Erro durante verificação: {str(e)}")
-        raise
-
-# Calcular data de início dinâmica
-start_date = datetime.now() - timedelta(days=1)
-
-# Configuração de nós do cluster
-class ClusterConfig:
-    MAX_BLOCKS = 100
-    MAX_HEALTH_RATE = 0.05
-    MIN_NODES = 3
-    MAX_NODES = 30
-    SCALE_DOWN_STEPS = [14, 8, 5, 3]
-
-# Definição do DAG
 with DAG(
-    "dag_name",
-    start_date=start_date,
+    dag_id="cluster_autoscaling_dag",
+    start_date=pendulum.datetime(2025, 1, 1, tz=ClusterConfig.TIMEZONE),
     default_args=default_args,
-    schedule_interval=None,
+    schedule=None,
     catchup=False,
     max_active_runs=1,
-    tags=["PRODUCTION", "MONTHLY"],
-    on_success_callback=send_slack_notification,  # Notificação de sucesso
-    doc_md="""
-    # Cluster Autoscaling DAG
-    
-    Gerencia o escalonamento automático de clusters com base no horário e métricas de saúde.
-    """,
+    tags=["PRODUCTION", "AUTOSCALING", "CDP"],
+    on_success_callback=send_slack_notification,
+    doc_md=__doc__,
 ) as dag:
+
     t_check_hour = BranchPythonOperator(
         task_id="check_hour",
         python_callable=check_hour,
     )
 
     with TaskGroup(
-        "upscale_cluster",
-        tooltip="Grupo de tarefas para escalonamento para cima"
+        group_id="upscale_cluster",
+        tooltip="Escalonamento para cima e aguardo de processamento externo",
     ) as upscale_group:
         upscale_nodes = SSHOperator(
             task_id="upscale_nodes",
-            ssh_conn_id="default_ssh_conn_id",
-            command=f"cdp datahub scale-cluster --cluster-name {CLUSTER_NAME} --instance-group-name worker --instance-group-desired-count {ClusterConfig.MAX_NODES}",
-            execution_timeout=timedelta(minutes=10),
+            ssh_conn_id=ClusterConfig.SSH_CONN_ID,
+            command=(
+                "cdp datahub scale-cluster "
+                "--cluster-name {{ var.value.CLUSTER_NAME }} "
+                f"--instance-group-name {ClusterConfig.INSTANCE_GROUP} "
+                f"--instance-group-desired-count {ClusterConfig.MAX_NODES}"
+            ),
+            execution_timeout=timedelta(minutes=15),
         )
 
+        wait_external_workload = ExternalTaskSensor(
+            task_id="wait_external_workload",
+            external_dag_id="{{ var.value.get('EXTERNAL_WORKLOAD_DAG_ID', 'workload_principal_dag') }}",
+            external_task_id=None,
+            allowed_states=["success"],
+            failed_states=["failed", "upstream_failed"],
+            mode="reschedule",
+            poke_interval=60,
+            timeout=60 * 60 * 4,
+        )
+
+        upscale_nodes >> wait_external_workload
+
     with TaskGroup(
-        "downscale_cluster",
-        tooltip="Grupo de tarefas para escalonamento para baixo"
+        group_id="downscale_cluster",
+        tooltip="Validação de saúde e redução gradual de nós do cluster",
     ) as downscale_group:
         previous_task = None
-        for nodes in ClusterConfig.SCALE_DOWN_STEPS:
-            downscale = SSHOperator(
-                task_id=f"downscale_{nodes}_nodes",
-                ssh_conn_id="default_ssh_conn_id",
-                command=f"cdp datahub scale-cluster --cluster-name {CLUSTER_NAME} --instance-group-name worker --instance-group-desired-count {nodes}",
-                retries=3,
-                retry_delay=timedelta(minutes=2),
-                execution_timeout=timedelta(minutes=5),
+
+        for step_index, nodes in enumerate(ClusterConfig.SCALE_DOWN_STEPS):
+            # A primeira verificação pode ser acionada tanto após o upscale quanto diretamente pelo Branch
+            step_trigger_rule = (
+                TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS
+                if step_index == 0
+                else TriggerRule.ALL_SUCCESS
             )
+
             verify_task = PythonOperator(
                 task_id=f"verify_downscale_{nodes}",
                 python_callable=verify_cluster_state,
-                op_args=[nodes],
-                provide_context=True,
+                op_kwargs={"target_nodes": nodes},
+                trigger_rule=step_trigger_rule,
                 execution_timeout=timedelta(minutes=5),
             )
+
+            downscale_task = SSHOperator(
+                task_id=f"downscale_{nodes}_nodes",
+                ssh_conn_id=ClusterConfig.SSH_CONN_ID,
+                command=(
+                    "cdp datahub scale-cluster "
+                    "--cluster-name {{ var.value.CLUSTER_NAME }} "
+                    f"--instance-group-name {ClusterConfig.INSTANCE_GROUP} "
+                    f"--instance-group-desired-count {nodes}"
+                ),
+                retries=3,
+                retry_delay=timedelta(minutes=2),
+                execution_timeout=timedelta(minutes=10),
+            )
+
             if previous_task:
-                previous_task >> downscale
-            downscale >> verify_task
-            previous_task = verify_task
+                previous_task >> verify_task
 
-    success = EmptyOperator(task_id="downscale_success")
+            # Verifica a saúde do cluster ANTES de reduzir os nós
+            verify_task >> downscale_task
+            previous_task = downscale_task
 
-    t_check_hour >> [upscale_group, success]
-    upscale_group >> downscale_group
-    downscale_group >> success
+    downscale_success = EmptyOperator(
+        task_id="downscale_success",
+        trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS,
+    )
+
+    t_check_hour >> [upscale_group, downscale_group]
+    upscale_group >> downscale_group >> downscale_success
