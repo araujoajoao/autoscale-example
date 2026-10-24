@@ -1,123 +1,72 @@
 # Cluster Autoscaling DAG Documentation
 
 ## Overview
-This DAG manages the **automatic scaling of cluster nodes** based on time and cluster health metrics. It uses **Apache Airflow** to perform tasks such as monitoring HDFS replication and cluster health, and executing upscaling or downscaling operations. 
 
-### Key Features
-- **Dynamic Cluster Scaling**: Automatically scales nodes up or down based on predefined conditions.
-- **HDFS Health Monitoring**: Validates HDFS block replication and cluster health before scaling.
-- **Error Handling**: Integrates with custom notification systems to alert on failures.
-- **Success Notifications**: Sends success messages to Slack when the DAG completes successfully.
-- **Task Grouping**: Organizes tasks into logical groups for better readability and management.
+This DAG (`cluster_autoscaling_dag`) manages the automatic scaling of Cloudera Data Platform (CDP) DataHub worker nodes based on execution time, external workload completion, and real-time cluster health metrics. Built on Apache Airflow 2.x, it monitors HDFS block replication and cluster health rates before stepping down node counts.
 
----
+## Key Features
 
-## DAG Structure
+- **Dynamic Cluster Scaling**: Scales worker nodes up to peak capacity during business hours or steps them down gradually during off-peak periods.
+- **Pre-Downscale HDFS Health Verification**: Validates HDFS under-replicated blocks and cluster health error rates *before* each downscale step to prevent data loss or instability.
+- **Lazy Variable Evaluation**: Reads Airflow Variables at task runtime or via Jinja templates (`{{ var.value.* }}`), avoiding top-level database queries during scheduler DAG parsing.
+- **External Workload Synchronization**: Uses `ExternalTaskSensor` (in `reschedule` mode) after upscaling so worker slots are freed while waiting for heavy processing DAGs to finish.
+- **Automated Alerting**: Sends failure alerts via `FindLogErrors` email callbacks and completion notifications to Slack via webhook.
 
-### 1. **Validation and Scheduling**
-- Validates environment variables (`NAMENODE`, `CLUSTER_NAME`, `API_CREDENTIALS`) before execution.
-- Dynamically sets the start date as 1 day prior to the current date.
-- Runs with a **manual trigger** (`schedule_interval=None`) and only allows one active run at a time (`max_active_runs=1`).
+## Architecture & DAG Flow
 
-### 2. **Task Groups**
-#### **Upscale Cluster**
-- Scales the cluster to its maximum number of nodes (`MAX_NODES`) using the Cloudera Data Platform (CDP) `scale-cluster` command.
-- Ensures sufficient resources are allocated during high-load periods.
+1. **Branching by Business Hours (`check_hour`)**
+   - Evaluates the current hour in the configured timezone (`America/Sao_Paulo`, 08:00–18:00):
+     - **08:00 to 18:00 (Business Hours)**: Branches to `upscale_cluster.upscale_nodes`.
+     - **Off-Peak Hours**: Branches directly to `downscale_cluster.verify_downscale_14` to safely reduce cluster capacity.
+2. **Upscale & Workload Wait (`upscale_cluster`)**
+   - **`upscale_nodes`**: Scales the `worker` instance group to `MAX_NODES` (`30`) via the CDP CLI over SSH.
+   - **`wait_external_workload`**: Waits for the target processing DAG (`EXTERNAL_WORKLOAD_DAG_ID`) to complete before initiating the downscale sequence.
+3. **Gradual Downscale (`downscale_cluster`)**
+   - Iterates through predefined node thresholds (`14 → 8 → 5 → 3`).
+   - For each step:
+     1. **`verify_downscale_<N>`**: Queries Cloudera Manager timeseries metrics (`under_replicated_blocks_across_hdfss` and `health_bad_rate`) over the last 60 minutes. Aborts with `AirflowException` if thresholds are exceeded.
+     2. **`downscale_<N>_nodes`**: Executes the `cdp datahub scale-cluster` command to reduce the worker count to `<N>`.
+4. **Completion (`downscale_success`)**
+   - Consolidates execution paths using `TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS` and triggers the `send_slack_notification` callback on DAG completion.
 
-#### **Downscale Cluster**
-- Scales down the cluster in predefined steps (`SCALE_DOWN_STEPS`).
-- Verifies health and HDFS block replication before each downscale step to prevent unsafe operations.
+## Configuration
 
-### 3. **Notification System**
-- **On Failure**: Sends error notifications via email using the `FindLogErrors` system.
-- **On Success**: Sends a success message to Slack using the provided webhook URL.
+### Airflow Variables
 
----
+| Variable Name | Required | Description |
+| :--- | :--- | :--- |
+| `NAMENODE` | Yes | Base URL of the Cloudera Manager / HDFS NameNode proxy API. |
+| `CLUSTER_NAME` | Yes | Name of the CDP DataHub cluster to scale. |
+| `API_CREDENTIALS` | Yes | `Authorization` header value for Cloudera Manager API requests. |
+| `EXTERNAL_WORKLOAD_DAG_ID` | No | External DAG ID to wait for after upscaling (defaults to `workload_principal_dag`). |
+| `SLACK_WEBHOOK_URL` | No | Incoming Webhook URL for Slack success notifications. |
 
-## Key Components
+### Scaling Parameters (`ClusterConfig`)
 
-### **Environment Variables**
-The DAG depends on the following environment variables:
-- `NAMENODE`: URL of the HDFS NameNode.
-- `CLUSTER_NAME`: Name of the cluster to manage.
-- `API_CREDENTIALS`: Credentials for API authentication.
-- `BUCKET_INTERMEDIARY`: GCS bucket path for intermediary files.
-- `SLACK_WEBHOOK_URL` (Optional): Webhook URL for sending Slack notifications.
+| Parameter | Default Value | Description |
+| :--- | :--- | :--- |
+| `MAX_BLOCKS` | `100` | Maximum allowed under-replicated HDFS blocks before a downscale step. |
+| `MAX_HEALTH_RATE` | `0.05` | Maximum allowed cluster `health_bad_rate` (5%) before a downscale step. |
+| `MAX_NODES` | `30` | Target worker node count during upscaling. |
+| `MIN_NODES` | `3` | Minimum worker node count after full downscaling. |
+| `SCALE_DOWN_STEPS` | `(14, 8, 5, 3)` | Sequential worker counts applied during gradual downscaling. |
+| `BUSINESS_HOUR_START` | `8` | Start hour (24h format) for the upscale window. |
+| `BUSINESS_HOUR_END` | `18` | End hour (24h format) for the upscale window. |
 
-### **Configurations**
-The DAG uses the `ClusterConfig` class to manage scaling parameters:
-- `MAX_BLOCKS`: Maximum number of under-replicated HDFS blocks allowed before scaling down.
-- `MAX_HEALTH_RATE`: Maximum cluster health error rate.
-- `SCALE_DOWN_STEPS`: Steps for downscaling nodes (e.g., 14 → 8 → 5 → 3).
-- `MAX_NODES`: Maximum nodes for upscaling.
-- `MIN_NODES`: Minimum nodes after scaling down.
+## Core Components
 
----
+### `ClusterMetrics.fetch_metric(namenode_url, api_credentials, query, start_time_ms, end_time_ms)`
+Queries `/cdp-proxy-api/cm-api/v51/timeseries` on Cloudera Manager and safely extracts the latest metric value, returning `0.0` when time series arrays are empty and raising `AirflowException` on network or HTTP errors.
 
-## Functions
+### `verify_cluster_state(target_nodes, **context)`
+Runs prior to each `SSHOperator` downscale task. Fetches HDFS replication and cluster health metrics for the past hour and blocks scaling if `blocks > MAX_BLOCKS` or `health_bad_rate > MAX_HEALTH_RATE`.
 
-### **Metrics Fetching**
-#### `ClusterMetrics.fetch_metric(query, cluster_name, start_time, end_time)`
-- A generic function to query metrics from the Cloudera Manager API.
-- **Input**: Query string, cluster name, and time range (start and end time in milliseconds).
-- **Output**: Latest value of the requested metric.
-
-### **Scaling Verification**
-#### `verify_cluster_state(nodes, **kwargs)`
-- Ensures the cluster's HDFS blocks and health are within safe thresholds before scaling down.
-- Raises an `AirflowException` if conditions are unsafe.
-
-### **Slack Notifications**
-#### `send_slack_notification(**kwargs)`
-- Sends a success message to a Slack channel using the webhook URL provided in the `SLACK_WEBHOOK_URL` variable.
-
----
-
-## DAG Flow
-
-1. **Branching by Hour**
-   - Checks the current hour to decide:
-     - **If after 10 AM**: Proceed to upscale the cluster.
-     - **If before 10 AM**: Skip to post-downscale validation.
-2. **Upscale**
-   - Executes the upscale operation to the maximum number of nodes (`MAX_NODES`).
-   - Waits for an external DAG to complete before continuing.
-3. **Metrics Collection**
-   - Queries HDFS under-replicated blocks and health error rate.
-4. **Downscale**
-   - Sequentially scales down nodes in steps.
-   - Verifies HDFS and cluster health metrics at each step.
-5. **Completion**
-   - Ends with a success task and sends a Slack notification.
-
----
+### `send_slack_notification(context)`
+DAG-level `on_success_callback` that posts the DAG ID and logical execution date to Slack when `SLACK_WEBHOOK_URL` is configured.
 
 ## Dependencies
-### External
-- Requires an external DAG to complete successfully before proceeding to cluster scaling operations.
 
-### Python Packages
-- `requests`: For API calls and Slack notifications.
-- `airflow.providers.ssh.operators.ssh.SSHOperator`: For executing CDP commands.
-- `airflow.sensors.external_task_sensor.ExternalTaskSensor`: For monitoring external DAGs.
-
----
-
-## Example Use Cases
-- **Hadoop Workloads**: Autoscaling a Hadoop cluster to optimize resource usage during peak and off-peak hours.
-- **Cost Optimization**: Ensures the cluster runs with minimal nodes during low-demand periods while maintaining safety thresholds.
-
----
-
-## Improvements and Extensibility
-1. **Additional Metrics**:
-   - Add more metrics for comprehensive cluster health checks (e.g., CPU utilization, memory usage).
-2. **Error Reporting**:
-   - Integrate with other notification systems like Microsoft Teams or PagerDuty.
-3. **Dynamic Schedule**:
-   - Allow dynamic schedules based on workload patterns.
-
----
-
-## Conclusion
-This DAG provides a robust framework for **cluster autoscaling** in a **Cloudera environment**. It ensures operational safety, optimizes resource usage, and provides flexibility to adapt to various workloads.
+- `apache-airflow>=2.4`
+- `apache-airflow-providers-ssh`
+- `requests`
+- `pendulum`
